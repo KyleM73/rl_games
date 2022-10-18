@@ -33,6 +33,7 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
             NetworkBuilder.BaseNetwork.__init__(self)
             self.load(params)
             self.linear_proj = nn.Sequential()
+            self.img_feature_encoder = nn.Sequential()
             self.actor_cnn = nn.Sequential()
             self.critic_cnn = nn.Sequential()
             self.actor_mlp = nn.Sequential()
@@ -44,8 +45,8 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
 
             linear_proj_args = {
             'input_size' : vec_num_inputs,
-            'units' : [self.linear_proj_shape],
-            'activation' : 'None',
+            'units' : [self.linear_projection['shape']],
+            'activation' : self.linear_projection['activation'],
             'norm_func_name' : None,
             'dense_func' : torch.nn.Linear,
             'd2rl' : False,
@@ -69,7 +70,23 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                 if self.separate:
                     self.critic_cnn = self._build_conv( **cnn_args)
 
-            mlp_input_shape = self.linear_proj_shape + self._calc_input_size(img_num_inputs, self.actor_cnn)
+            if self.has_image_feature_encoder:
+                img_feature_encoder_args = {
+                'input_size' : self._calc_input_size(img_num_inputs, self.actor_cnn),
+                'units' : self.image_feature_encoder['shape'],
+                'activation' : self.image_feature_encoder['activation'],
+                'norm_func_name' : None,
+                'dense_func' : torch.nn.Linear,
+                'd2rl' : False,
+                'norm_only_first_layer' : False
+                }
+
+                self.img_encoder = self._build_mlp(**img_feature_encoder_args)
+
+                mlp_input_shape = self.linear_projection['shape'] + self.image_feature_encoder['shape'][-1]
+
+            else:
+                mlp_input_shape = self.linear_projection['shape'] + self._calc_input_size(img_num_inputs, self.actor_cnn)
 
             in_mlp_shape = mlp_input_shape
             if len(self.units) == 0:
@@ -153,6 +170,11 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
 
                     c_out = self.critic_cnn(c_out)
                     c_out = c_out.contiguous().view(c_out.size(0), -1)
+
+                    if self.has_image_feature_encoder:
+                        a_out = self.img_encoder(a_out)
+                        c_out = self.img_encoder(c_out)
+
                     self.img_features = (a_out.data,c_out.data)
                     assert a_out.size()[0] == c_out.size()[0]
                     self.num_features = a_out.size()[0]
@@ -190,6 +212,7 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                     out = img
                     out = self.actor_cnn(out)
                     out = out.flatten(1)
+                    out = self.img_encoder(out)
                     self.img_features = out.data
                     self.num_features = out.size()[0]
                     self.flag = False
@@ -232,7 +255,6 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
             self.normalization = params.get('normalization', None)
             self.has_space = 'space' in params
             self.central_value = params.get('central_value', False)
-            self.linear_proj_shape = params.get('linear_projection', 16)
 
             if self.has_space:
                 self.is_multi_discrete = 'multi_discrete'in params['space']
@@ -249,6 +271,14 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                 self.is_discrete = False
                 self.is_continuous = False
                 self.is_multi_discrete = False
+
+            self.linear_projection = params['linear_projection']
+            
+            if 'image_feature_encoder' in params:
+                self.has_image_feature_encoder = True
+                self.image_feature_encoder = params['image_feature_encoder']
+            else:
+                self.has_image_feature_encoder = False
 
             if 'cnn' in params:
                 self.has_cnn = True
