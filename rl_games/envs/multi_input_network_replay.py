@@ -36,12 +36,16 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
             self.img_feature_encoder = nn.Sequential()
             self.actor_cnn = nn.Sequential()
             self.critic_cnn = nn.Sequential()
+            self.cnn_out_mlp = nn.Sequential()
             self.actor_mlp = nn.Sequential()
             self.critic_mlp = nn.Sequential()
 
             self.img_features = None
             self.num_features = 0 # better way to set value?
             self.flag = True
+
+            if self.has_cnn_out:
+                actions_num -= self.cnn_out['shape'][0]
 
             linear_proj_args = {
             'input_size' : vec_num_inputs,
@@ -68,7 +72,20 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                 self.actor_cnn = self._build_conv(**cnn_args)
 
                 if self.separate:
-                    self.critic_cnn = self._build_conv( **cnn_args)
+                    self.critic_cnn = self._build_conv(**cnn_args)
+
+                if self.has_cnn_out:
+                    inp_size = self.image_feature_encoder['shape'][-1] if self.has_image_feature_encoder else self._calc_input_size(img_num_inputs, self.actor_cnn)
+                    cnn_out_args = {
+                        'input_size' : inp_size,
+                        'units' : self.cnn_out['shape'],
+                        'activation' : self.cnn_out['activation'],
+                        'norm_func_name' : None,
+                        'dense_func' : torch.nn.Linear,
+                        'd2rl' : False,
+                        'norm_only_first_layer' : False
+                        }
+                    self.cnn_out_mlp = self._build_mlp(**cnn_out_args)
 
             if self.has_image_feature_encoder:
                 img_feature_encoder_args = {
@@ -121,6 +138,9 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                     self.sigma = nn.Parameter(torch.zeros(actions_num, requires_grad=True, dtype=torch.float32), requires_grad=True)
                 else:
                     self.sigma = torch.nn.Linear(out_size, actions_num)
+                if self.has_cnn_out:
+                    self.sigma_cnn_out = nn.Parameter(torch.zeros(self.cnn_out['shape'][0], requires_grad=True, dtype=torch.float32), requires_grad=True)
+                    self.sigma_act_cnn_out = self.activations_factory.create('None')
 
             mlp_init = self.init_factory.create(**self.initializer)
             if self.has_cnn:
@@ -141,7 +161,9 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                 if self.fixed_sigma:
                     sigma_init(self.sigma)
                 else:
-                    sigma_init(self.sigma.weight)  
+                    sigma_init(self.sigma.weight)
+                if self.has_cnn_out:
+                    sigma_init(self.sigma_cnn_out)  
 
         def forward(self, obs_dict):
             obs = obs_dict['obs']
@@ -205,14 +227,13 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                         sigma = mu * 0.0 + self.sigma_act(self.sigma)
                     else:
                         sigma = self.sigma_act(self.sigma(a_out))
-
                     return mu, sigma, value, states
             else:
                 if self.flag or self.num_features != vec_out.size()[0]:
                     out = img
                     out = self.actor_cnn(out)
                     out = out.flatten(1)
-                    out = self.img_encoder(out)
+                    self.cnn_output = out = self.img_encoder(out)
                     self.img_features = out.data
                     self.num_features = out.size()[0]
                     self.flag = False
@@ -239,6 +260,12 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                         sigma = self.sigma_act(self.sigma)
                     else:
                         sigma = self.sigma_act(self.sigma(out))
+                    if self.has_cnn_out:
+                        cnn_mu = self.cnn_out_mlp(self.cnn_output)
+                        action = torch.cat((mu,cnn_mu),dim=-1)
+                        sigma_cnn = self.sigma_act_cnn_out(self.sigma_cnn_out)
+                        sigma = torch.cat((sigma,sigma_cnn),dim=0)
+                        return action, sigma, value, states
                     return mu, mu*0 + sigma, value, states
                     
         def is_separate_critic(self):
@@ -256,6 +283,7 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
             self.norm_only_first_layer = params['mlp'].get('norm_only_first_layer', False)
             self.value_activation = params.get('value_activation', 'None')
             self.normalization = params.get('normalization', None)
+            self.has_rnn = 'rnn' in params
             self.has_space = 'space' in params
             self.central_value = params.get('central_value', False)
 
@@ -287,8 +315,14 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                 self.has_cnn = True
                 self.cnn = params['cnn']
                 self.permute_input = self.cnn.get('permute_input', True)
+                if 'cnn_out' in params['cnn']:
+                    self.has_cnn_out = True
+                    self.cnn_out = params['cnn']['cnn_out']
+                else:
+                    self.has_cnn_out = False
             else:
                 self.has_cnn = False
+                self.has_cnn_out = False
 
     def build(self, name, **kwargs):
         net = Multi_Input_Replay_A2CBuilder.Network(self.params, **kwargs)
