@@ -236,7 +236,7 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                     self.cnn_output = out = self.img_encoder(out)
                     self.img_features = out.data
                     self.num_features = out.size()[0]
-                    self.flag = False
+                    #self.flag = False
                 else:
                     out = self.img_features
                     self.flag = True
