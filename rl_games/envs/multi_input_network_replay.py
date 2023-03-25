@@ -262,7 +262,7 @@ class Multi_Input_Replay_A2CBuilder(NetworkBuilder):
                         sigma = self.sigma_act(self.sigma(out))
                     if self.has_cnn_out:
                         cnn_mu = self.cnn_out_mlp(self.cnn_output)
-                        action = torch.cat((mu,cnn_mu),dim=-1)
+                        action = torch.cat((mu,cnn_mu),dim=len(mu.shape) + (-1)) #-1
                         sigma_cnn = self.sigma_act_cnn_out(self.sigma_cnn_out)
                         sigma = torch.cat((sigma,sigma_cnn),dim=0)
                         return action, sigma, value, states
