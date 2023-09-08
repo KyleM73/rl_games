@@ -48,6 +48,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 'writter' : self.writer,
                 'max_epochs' : self.max_epochs,
                 'multi_gpu' : self.multi_gpu,
+                'zero_rnn_on_done' : self.zero_rnn_on_done
             }
             self.central_value_net = central_value.CentralValueTrain(**cv_config).to(self.ppo_device)
 
@@ -56,8 +57,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         if self.normalize_value:
             self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
 
-        self.has_value_loss = (self.has_central_value and self.use_experimental_cv) \
-                            or (not self.has_phasic_policy_gradients and not self.has_central_value) 
+        self.has_value_loss = self.use_experimental_cv or not self.has_central_value
         self.algo_observer.after_init(self)
 
     def update_epoch(self):
@@ -100,8 +100,10 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             rnn_masks = input_dict['rnn_masks']
             batch_dict['rnn_states'] = input_dict['rnn_states']
             batch_dict['seq_length'] = self.seq_len
-            batch_dict['dones'] = input_dict['dones']
-            
+
+            if self.zero_rnn_on_done:
+                batch_dict['dones'] = input_dict['dones']            
+
         with torch.cuda.amp.autocast(enabled=self.mixed_precision):
             res_dict = self.model(batch_dict)
             action_log_probs = res_dict['prev_neglogp']
@@ -113,7 +115,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
 
             if self.has_value_loss:
-                c_loss = common_losses.critic_loss(value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
+                c_loss = common_losses.critic_loss(self.model,value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
             else:
                 c_loss = torch.zeros(1, device=self.ppo_device)
             if self.bound_loss_type == 'regularisation':

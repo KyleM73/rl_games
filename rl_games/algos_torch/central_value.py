@@ -2,17 +2,19 @@ import os
 import torch
 from torch import nn
 import torch.distributed as dist
-import gym
-import numpy as np
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.running_mean_std import RunningMeanStd, RunningMeanStdObs
 from rl_games.common  import common_losses
 from rl_games.common import datasets
 from rl_games.common import schedulers
 
+
 class CentralValueTrain(nn.Module):
-    def __init__(self, state_shape, value_size, ppo_device, num_agents, horizon_length, num_actors, num_actions, seq_len, normalize_value,network, config, writter, max_epochs, multi_gpu):
+
+    def __init__(self, state_shape, value_size, ppo_device, num_agents, horizon_length, num_actors, num_actions, 
+                seq_len, normalize_value, network, config, writter, max_epochs, multi_gpu, zero_rnn_on_done):
         nn.Module.__init__(self)
+
         self.ppo_device = ppo_device
         self.num_agents, self.horizon_length, self.num_actors, self.seq_len = num_agents, horizon_length, num_actors, seq_len
         self.normalize_value = normalize_value
@@ -24,6 +26,8 @@ class CentralValueTrain(nn.Module):
         self.truncate_grads = config.get('truncate_grads', False)
         self.config = config
         self.normalize_input = config['normalize_input']
+        self.zero_rnn_on_done = zero_rnn_on_done
+
         state_config = {
             'value_size' : value_size,
             'input_shape' : state_shape,
@@ -37,16 +41,19 @@ class CentralValueTrain(nn.Module):
         self.model = network.build(state_config)
         self.lr = float(config['learning_rate'])
         self.linear_lr = config.get('lr_schedule') == 'linear'
+
+        # todo: support max frames as well
         if self.linear_lr:
             self.scheduler = schedulers.LinearScheduler(self.lr, 
-                max_steps=self.max_epochs, 
-                apply_to_entropy=False,
-                start_entropy_coef=0)
+                max_steps = self.max_epochs, 
+                apply_to_entropy = False,
+                start_entropy_coef = 0)
         else:
             self.scheduler = schedulers.IdentityScheduler()
         
         self.mini_epoch = config['mini_epochs']
         assert(('minibatch_size_per_env' in self.config) or ('minibatch_size' in self.config))
+
         self.minibatch_size_per_env = self.config.get('minibatch_size_per_env', 0)
         self.minibatch_size = self.config.get('minibatch_size', self.num_actors * self.minibatch_size_per_env)
         self.num_minibatches = self.horizon_length * self.num_actors // self.minibatch_size
@@ -66,6 +73,7 @@ class CentralValueTrain(nn.Module):
         self.is_rnn = self.model.is_rnn()
         self.rnn_states = None
         self.batch_size = self.horizon_length * self.num_actors
+
         if self.is_rnn:
             self.rnn_states = self.model.get_default_rnn_state()
             self.rnn_states = [s.to(self.ppo_device) for s in self.rnn_states]
@@ -74,14 +82,21 @@ class CentralValueTrain(nn.Module):
             assert ((self.horizon_length * total_agents // self.num_minibatches) % self.seq_len == 0)
             self.mb_rnn_states = [ torch.zeros((num_seqs, s.size()[0], total_agents, s.size()[2]), dtype=torch.float32, device=self.ppo_device) for s in self.rnn_states]
 
+        self.local_rank = 0
+        self.global_rank = 0
+        self.world_size = 1
         if self.multi_gpu:
-            self.rank = int(os.getenv("LOCAL_RANK", "0"))
-            self.rank_size = int(os.getenv("WORLD_SIZE", "1"))
-            # dist.init_process_group("nccl", rank=self.rank, world_size=self.rank_size)
+            # local rank of the GPU in a node
+            self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
+            # global rank of the GPU
+            self.global_rank = int(os.getenv("RANK", "0"))
+            # total number of GPUs across all nodes
+            self.world_size = int(os.getenv("WORLD_SIZE", "1"))
 
-            self.device_name = 'cuda:' + str(self.rank)
+            self.device_name = 'cuda:' + str(self.local_rank)
             config['device'] = self.device_name
-            if self.rank != 0:
+
+            if self.global_rank != 0:
                 config['print_stats'] = False
                 config['lr_schedule'] = None
 
@@ -129,9 +144,11 @@ class CentralValueTrain(nn.Module):
                 states.append(mb_s.permute(1,2,0,3).reshape(-1, t_size, h_size))
 
             batch_dict['rnn_states'] = states
+            '''
             if self.num_agents > 1:
                 rnn_masks = res[3]
             batch_dict['rnn_masks'] = rnn_masks
+            '''
         self.dataset.update_values_dict(batch_dict)
 
     def _preproc_obs(self, obs_batch):
@@ -154,8 +171,10 @@ class CentralValueTrain(nn.Module):
             for s, mb_s in zip(self.rnn_states, self.mb_rnn_states):
                 mb_s[n // self.seq_len,:,:,:] = s
 
-    def post_step_rnn(self, all_done_indices):
+    def post_step_rnn(self, all_done_indices, zero_rnn_on_done=True):
         if not self.is_rnn:
+            return
+        if not self.zero_rnn_on_done:
             return
         all_done_indices = all_done_indices[::self.num_agents] // self.num_agents
         for s in self.rnn_states:
@@ -233,9 +252,11 @@ class CentralValueTrain(nn.Module):
 
         res_dict = self.model(batch_dict)
         values = res_dict['values']
-        loss = common_losses.critic_loss(value_preds_batch, values, self.e_clip, returns_batch, self.clip_value)
+        loss = common_losses.critic_loss(self.model, value_preds_batch, values, self.e_clip, returns_batch, self.clip_value)
+        #print(loss.min(), loss.max(), loss.size(), rnn_masks_batch)
         losses, _ = torch_ext.apply_masks([loss], rnn_masks_batch)
         loss = losses[0]
+        #6print('aaa', loss.min(), loss.max(), loss.size())
         if self.multi_gpu:
             self.optimizer.zero_grad()
         else:
@@ -255,7 +276,7 @@ class CentralValueTrain(nn.Module):
             for param in self.model.parameters():
                 if param.grad is not None:
                     param.grad.data.copy_(
-                        all_grads[offset : offset + param.numel()].view_as(param.grad.data) / self.rank_size
+                        all_grads[offset : offset + param.numel()].view_as(param.grad.data) / self.world_size
                     )
                     offset += param.numel()
 
